@@ -28,3 +28,7 @@ eureka:
     enabled: true
     service-url:
       defaultZone: http://localhost:8761/eureka/
+
+jwt:
+  secret: "gamestore-super-secure-secret-key-gamestore-2026-very-long-key-32bytes-min"
+  expiration-ms: 3600000
