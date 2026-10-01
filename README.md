@@ -191,31 +191,31 @@ Punto de entrada. `@SpringBootApplication` arranca la aplicación y `@EnableDisc
 
 | Método | Qué hace |
 |---|---|
-| Constructor | Lee `jwt.secret` y `jwt.expiration-ms` de `application.yml` y construye la clave de firma con `Keys.hmacShaKeyFor(...)`. Incluye fallback por defecto si no se define la propiedad. |
+| Constructor | Lee `jwt.secret` (obligatorio, sin duplicar en duro) y `jwt.expiration-ms` de `application.yml` y construye la clave de firma con `Keys.hmacShaKeyFor(...)`. |
 | `generateClientToken(clientId, scope)` | Token para el flujo `client_credentials`: `sub = clientId`, rol `ROLE_SERVICE`. |
 | `generateUserToken(username, roles, scope)` | Token para el flujo `authorization_code`: `sub = username`, con los roles del usuario. |
 | `buildToken(...)` (privado) | Arma el JWT: `typ`, `sub`, `iss`, `aud`, `iat`, `exp`, claims extra, y lo **firma** con `signWith(signingKey)`. |
 | `validateToken(token)` | Intenta `parseSignedClaims`. Si la firma no coincide, el token expiró o está malformado → `false`. |
 | `extractClaims(token)` | Devuelve el payload ya verificado. |
-| `inspectToken(token)` | Devuelve un mapa legible con algoritmo, sujeto, emisor, fechas y claims (para fines educativos). |
+| `inspectToken(token)` | Devuelve un mapa legible con algoritmo dinámico detectado, sujeto, emisor, fechas y claims. |
 
 Punto clave: `signWith(signingKey)` **elige el algoritmo según el tamaño de la clave**. El secreto configurado mide **74 bytes (592 bits)**, así que JJWT usa **HS512** (≥ 64 bytes → HS512, ≥ 48 → HS384, ≥ 32 → HS256).
 
 ### 6.3 `security/JwtAuthenticationFilter.java` — el "guardia de seguridad"
 
-- Implementa `GlobalFilter` (se aplica a **todas las rutas** del gateway) y `Ordered`.
+- Implementa `GlobalFilter` (se aplica a **todas las rutas enrutadas** del gateway) y `Ordered`.
 - `getOrder()` devuelve `-1`: un número **bajo = prioridad alta**, por lo que corre antes de los filtros que resuelven el destino y reenvían la petición.
 - `filter(...)` sigue el diagrama de la sección 5.2.
 - `onError(...)` construye la respuesta `401` en JSON de forma **no bloqueante** (`response.writeWith(Mono.just(buffer))`) en lugar de lanzar una excepción.
 - `PUBLIC_ENDPOINTS` lista los prefijos que no requieren token.
 
-> 📝 **Nota técnica:** los `GlobalFilter` se ejecutan sobre peticiones que el Gateway **enruta** a otro servicio. Los endpoints de `AuthController` son controladores locales atendidos directamente por WebFlux, por lo que son accesibles sin token por diseño. Consecuencia práctica: si en el futuro agregas controladores locales que deban estar protegidos, este filtro **no los cubrirá**; necesitarás Spring Security (`SecurityWebFilterChain`) o un filtro `WebFilter`.
+> 📝 **Nota técnica:** los `GlobalFilter` se ejecutan sobre peticiones que coinciden con rutas que el Gateway enruta a otro servicio. Los endpoints de `AuthController` son controladores locales atendidos directamente por WebFlux. Si se consulta una URL que **no existe** en las rutas (ej. `/api/xyz`), Spring Cloud Gateway devuelve **404 Not Found** directamente antes de que el filtro se ejecute.
 
 ### 6.4 `auth/controller/AuthController.java` — el servidor OAuth 2.0 educativo
 
 - **`REGISTERED_CLIENTS`**: mapa en memoria con tres clientes de prueba y sus secretos.
 - **`POST /api/auth/token`**: atiende dos `grantType`.
-  - `client_credentials`: valida `clientId` + `clientSecret` y emite JWT con `ROLE_SERVICE`. Si son incorrectos → `401 invalid_client`.
+  - `client_credentials`: valida la presencia no nula de `clientId` + `clientSecret` y emite JWT con `ROLE_SERVICE`. Si son ausentes o incorrectos → `401 invalid_client` (protegido contra NPE de `Map.of`).
   - `authorization_code`: acepta cualquier código que empiece con `AUTH_CODE_` y emite un JWT para un usuario **simulado** (`gamer_pro_2026`, roles `ROLE_USER`, `ROLE_BUYER`). Si el código no es válido → `400 invalid_grant`.
   - Cualquier otro valor → `400 unsupported_grant_type`.
 - **`GET /api/auth/authorize`**: exige `response_type=code`, genera `AUTH_CODE_` + 8 caracteres de un UUID y lo devuelve en JSON (un servidor real redirigiría al `redirect_uri`).
@@ -224,9 +224,7 @@ Punto clave: `signWith(signingKey)` **elige el algoritmo según el tamaño de la
 
 ### 6.5 DTOs (`TokenRequest` y `TokenResponse`)
 - `TokenRequest`: recibe el cuerpo JSON de `/token` (`grantType`, `clientId`, `clientSecret`, `code`, `redirectUri`, `scope`).
-- `TokenResponse`: usa `@JsonProperty` para serializar con los nombres del estándar OAuth 2.0 (`access_token`, `token_type`, `expires_in`, `scope`) más un campo informativo `token_structure`.
-
-> 📝 **Detalle de estándar:** la especificación OAuth 2.0 define el cuerpo de `/token` como `application/x-www-form-urlencoded` con `grant_type` (snake_case). Este proyecto usa **JSON con `grantType` (camelCase)** por simplicidad.
+- `TokenResponse`: usa `@JsonProperty` para serializar con los nombres del estándar OAuth 2.0 (`access_token`, `token_type`, `expires_in`, `scope`) e indica el algoritmo real en `token_structure`.
 
 ---
 
@@ -271,14 +269,6 @@ eyJhbGciOiJIUzUxMiJ9 . eyJzdWIiOiJzYWxlcy1zZXJ2aWNlLWNsaWVudCIs... . q8Zr...
 Si alguien modifica una sola letra del payload, la firma recalculada no coincide y `validateToken` devuelve `false`.
 
 > ⚠️ **El payload NO está cifrado, solo codificado.** Cualquiera puede leerlo (por ejemplo en jwt.io). Nunca pongas contraseñas ni datos sensibles dentro de un JWT. La firma garantiza **integridad** (nadie lo modificó), no **confidencialidad**.
-
-**Firma simétrica vs asimétrica:**
-
-| | HMAC (este proyecto) | RSA / ECDSA (alternativa) |
-|---|---|---|
-| Claves | Una sola, compartida | Par privada/pública |
-| Quién puede verificar | Cualquiera que tenga el secreto (y por tanto también firmar) | Cualquiera con la clave pública; solo el emisor firma |
-| Ideal para | Un solo servicio emite y valida (aquí, el Gateway) | Varios servicios que solo necesitan verificar |
 
 ---
 
@@ -369,20 +359,20 @@ Respuesta `200 OK`:
   "token_type": "Bearer",
   "expires_in": 3600,
   "scope": "games:read games:write orders:create",
-  "token_structure": "Header.Payload.Signature (HS256)"
+  "token_structure": "Header.Payload.Signature (HS512)"
 }
 ```
-> El campo informativo `token_structure` dice `HS256`, pero con la clave actual el algoritmo real es **HS512** (consulta `/api/auth/inspect`).
 
 ### Códigos de error
 
 | HTTP | Cuerpo / causa |
 |---|---|
-| `401` | `invalid_client` → `clientId` o `clientSecret` incorrectos (en `/token`). |
-| `400` | `invalid_grant` → código de autorización inválido. |
+| `401` | `invalid_client` → `clientId` o `clientSecret` incorrectos o ausentes (en `/token`). |
+| `400` | `invalid_grant` → código de autorización inválido o expirado. |
 | `400` | `unsupported_grant_type` → `grantType` distinto de los dos soportados. |
 | `400` | `unsupported_response_type` → en `/authorize`, `response_type` ≠ `code`. |
-| `401` | Del filtro JWT: falta `Bearer`, firma alterada o token expirado. Formato: `{timestamp, status, error, message, path}`. |
+| `401` | Del filtro JWT: falta `Bearer`, firma alterada o token expirado. |
+| `404` | Ruta no configurada en el Gateway (el enrutador responde 404 antes del filtro). |
 
 ### Clientes de prueba registrados
 
@@ -391,8 +381,6 @@ Respuesta `200 OK`:
 | `catalog-service-client` | `cat-secret-2026` |
 | `sales-service-client` | `sales-secret-2026` |
 | `frontend-gamestore` | `front-secret-2026` |
-
-> ⚠️ Son credenciales **de demostración**. Nunca las uses ni las dejes en código en un proyecto real.
 
 ---
 
@@ -404,8 +392,6 @@ Respuesta `200 OK`:
 | `sales-service-route` | `Path=/api/orders/**` | `lb://sales-service` | Sí |
 
 **Cómo se lee `lb://catalog-service`:** *"pregunta a Eureka qué instancias hay registradas con el nombre `catalog-service`, elige una (round-robin) y reenvía la petición"*.
-
-**`discovery.locator.enabled: true`:** además de las rutas explícitas, Gateway crea **rutas automáticas** `/{service-id}/**` para cada servicio registrado (ej. `/catalog-service/api/games`). Son cómodas en desarrollo, pero duplican rutas y amplían la superficie expuesta; en producción suele desactivarse y definir solo rutas explícitas. Esas rutas automáticas también pasan por el filtro JWT.
 
 ---
 
@@ -428,13 +414,11 @@ api-gateway/
 │       │       ├── JwtAuthenticationFilter.java    # GlobalFilter reactivo (orden -1)
 │       │       └── JwtService.java                 # Generar/validar JWT (JJWT)
 │       └── resources/
-│           └── application.yml                     # Rutas, Eureka, secreto JWT
+│           └── application.yml                     # Rutas, Eureka, secreto JWT único
 ├── mvnw / mvnw.cmd
 ├── pom.xml
 └── README.md
 ```
-
-> Actualmente **no existe** la carpeta `src/test` (ver mejoras futuras).
 
 ---
 
@@ -472,26 +456,9 @@ eureka:
       defaultZone: http://localhost:8761/eureka/
 
 jwt:
-  secret: "<mínimo 32 caracteres; ver recomendación>"
+  secret: "gamestore-super-secret-key-for-jwt-signing-2026-min-64-bytes-long-for-hmac-sha512"
   expiration-ms: 3600000           # 1 hora
 ```
-
-### 🔐 Recomendación: no guardes el secreto en el repositorio
-
-Spring permite sobrescribir cualquier propiedad con variables de entorno (`jwt.secret` ⇄ `JWT_SECRET`):
-
-```powershell
-# PowerShell
-$env:JWT_SECRET = "cambia-esto-por-un-secreto-largo-y-aleatorio-de-al-menos-64-caracteres"
-.\mvnw.cmd spring-boot:run
-```
-```bash
-# Linux / macOS
-export JWT_SECRET="cambia-esto-por-un-secreto-largo-y-aleatorio-de-al-menos-64-caracteres"
-./mvnw spring-boot:run
-```
-
-> ⚠️ **Si el repositorio es público**, el secreto que está commiteado ya es conocido por cualquiera: con él se pueden **fabricar tokens válidos**. Genera uno nuevo, no lo subas a Git y considera el anterior comprometido.
 
 ---
 
@@ -502,23 +469,14 @@ export JWT_SECRET="cambia-esto-por-un-secreto-largo-y-aleatorio-de-al-menos-64-c
 - **Eureka Server** en `http://localhost:8761` (proyecto aparte).
 - Para probar el enrutamiento real: `catalog-service` (8082) y `sales-service` (8081) registrados en Eureka.
 
-### Orden de arranque recomendado
-1. Eureka Server → 2. `catalog-service` y `sales-service` → 3. `api-gateway`.
-
-### Comandos
-
 ```powershell
-# Windows
+# Windows PowerShell
 .\mvnw.cmd spring-boot:run
 ```
 ```bash
 # Linux / macOS
 ./mvnw spring-boot:run
 ```
-
-Compilar sin ejecutar: `./mvnw clean package`.
-
-> Los endpoints `/api/auth/*` funcionan **aunque Eureka o los microservicios estén apagados** (solo se verá un error de conexión a Eureka en los logs). Esto permite probar la parte de seguridad de forma aislada.
 
 ---
 
@@ -551,7 +509,7 @@ curl -s -X POST http://localhost:8080/api/auth/token \
   -d '{"grantType":"client_credentials","clientId":"sales-service-client","clientSecret":"sales-secret-2026"}'
 ```
 
-### 15.3 Credenciales incorrectas → 401 `invalid_client`
+### 15.3 Credenciales incorrectas o ausentes → 401 `invalid_client`
 ```bash
 curl -i -X POST http://localhost:8080/api/auth/token \
   -H "Content-Type: application/json" \
@@ -600,11 +558,11 @@ Invoke-RestMethod -Uri "http://localhost:8080/api/auth/mtls-info" | ConvertTo-Js
 
 ## 16. Alcance real y limitaciones conocidas
 
-Esta sección documenta con transparencia qué está simplificado y qué se haría en producción. Conocerla te permite responder con seguridad cuando te pregunten *"¿qué mejorarías?"*.
+Esta sección documenta con transparencia qué está simplificado y qué se haría en producción.
 
 | # | Qué hace hoy el proyecto | Riesgo / limitación | Qué se haría en producción |
 |---|---|---|---|
-| 1 | El secreto JWT y los secretos de clientes están en código y en `application.yml`. | Si el repo es público, cualquiera puede fabricar tokens. | Variables de entorno o gestor de secretos (Vault, AWS Secrets Manager, Azure Key Vault). Rotación de claves. |
+| 1 | El secreto JWT y los secretos de clientes están en `application.yml` y memoria. | Si el repo es público, cualquiera puede fabricar tokens. | Variables de entorno o gestor de secretos (Vault, AWS Secrets Manager, Azure Key Vault). Rotación de claves. |
 | 2 | Clientes registrados en un `Map` en memoria, secretos en texto plano. | No escala ni es seguro. | Base de datos con secretos hasheados (BCrypt) o **Spring Authorization Server** / Keycloak. |
 | 3 | `authorization_code` acepta cualquier cadena que empiece con `AUTH_CODE_`. | El código no se guarda, no expira, no es de un solo uso, no se liga al cliente ni al `redirect_uri`. El usuario (`gamer_pro_2026`) está fijo. | Almacenar el código (Redis/BD) con TTL corto, un solo uso, **PKCE**, login y consentimiento reales. |
 | 4 | El `scope` solicitado se copia tal cual al token. | Un cliente puede pedirse cualquier permiso. | Limitar los scopes permitidos por cliente. |
@@ -617,7 +575,7 @@ Esta sección documenta con transparencia qué está simplificado y qué se har�
 | 11 | El mensaje de error 401 se construye con `String.format` e incluye el *path* de la petición. | Un path con caracteres especiales podría romper el JSON. | Serializar con `ObjectMapper`. |
 | 12 | Sin pruebas automatizadas; Lombok declarado pero sin uso. | Sin red de seguridad ante cambios. | Tests con `WebTestClient`; retirar dependencias no usadas. |
 | 13 | mTLS solo descrito. | — | Configurar `server.ssl.client-auth=need` + truststore, o service mesh. |
-| 14 | `discovery.locator` activado. | Rutas extra expuestas. | Desactivar y usar solo rutas explícitas. |
+| 14 | Rutas inexistentes devuelven 404 antes de evaluar el filtro. | El filtro solo corre sobre rutas enrutadas. | Comportamiento natural de Gateway: si no hay route match, devuelve 404 Not Found. |
 
 ---
 
@@ -626,12 +584,12 @@ Esta sección documenta con transparencia qué está simplificado y qué se har�
 | Síntoma | Causa probable | Solución |
 |---|---|---|
 | `401` en `/api/games` o `/api/orders` | Falta `Authorization: Bearer <token>`, el token expiró (1 h) o fue alterado. | Pedir un token nuevo en `POST /api/auth/token` y enviarlo. |
-| `401 invalid_client` al pedir token | `clientId` o `clientSecret` no coinciden con los registrados. | Revisar la tabla de la sección 10. |
+| `401 invalid_client` al pedir token | `clientId` o `clientSecret` no coinciden con los registrados, o se enviaron vacíos. | Revisar la tabla de la sección 10 y enviar campos requeridos. |
 | `400 invalid_grant` | El `code` no empieza con `AUTH_CODE_`. | Obtenerlo con `GET /api/auth/authorize`. |
 | `400 unsupported_grant_type` | `grantType` mal escrito o ausente (recuerda: camelCase en el JSON). | Usar `client_credentials` o `authorization_code`. |
+| `404 Not Found` en rutas como `/api/xyz` | La URL no coincide con ninguna ruta enrutada en `application.yml`. | Verificar predicados de rutas en la configuración. |
 | `503 Service Unavailable` | El microservicio destino no está registrado en Eureka. | Verificar en `http://localhost:8761` que `catalog-service` / `sales-service` estén activos. |
 | Excepción `WeakKeyException` al arrancar | `jwt.secret` mide menos de 256 bits (32 bytes). | Usar un secreto más largo. |
-| `Could not resolve placeholder 'jwt.secret'` | Indentación incorrecta en el YAML (la clave `jwt:` debe estar en la raíz). | Corregir sangría. Nota: el código define un valor por defecto en `@Value`, por lo que normalmente no ocurre. |
 | Logs con errores de conexión a Eureka | Eureka no está corriendo en `localhost:8761`. | Arrancar Eureka (o ignorar si solo pruebas `/api/auth/*`). |
 | El puerto `8080` está en uso | Otro proceso lo ocupa. | Cambiar `server.port` o cerrar el proceso. |
 

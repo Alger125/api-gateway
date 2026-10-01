@@ -19,7 +19,7 @@ public class JwtService {
     private final long expirationMillis;
 
     public JwtService(
-            @Value("${jwt.secret:gamestore-super-secure-secret-key-gamestore-2026-very-long-key-32bytes-min}") String secret,
+            @Value("${jwt.secret}") String secret,
             @Value("${jwt.expiration-ms:3600000}") long expirationMillis) {
         this.signingKey = Keys.hmacShaKeyFor(secret.getBytes(StandardCharsets.UTF_8));
         this.expirationMillis = expirationMillis;
@@ -88,7 +88,7 @@ public class JwtService {
             info.put("issuedAt", payload.getIssuedAt());
             info.put("expiration", payload.getExpiration());
             info.put("claims", payload);
-            info.put("structure", "Header (Base64Url) . Payload (Base64Url) . Signature (HMAC-SHA256)");
+            info.put("structure", "Header (Base64Url) . Payload (Base64Url) . Signature (" + header.getAlgorithm() + ")");
         } catch (JwtException | IllegalArgumentException e) {
             info.put("valid", false);
             info.put("error", e.getMessage());

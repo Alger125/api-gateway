@@ -39,13 +39,16 @@ public class AuthController {
         // FLUJO 1: Client Credentials (Machine-to-Machine / Microservicios)
         // -------------------------------------------------------------
         if ("client_credentials".equalsIgnoreCase(grantType)) {
-            String clientSecret = REGISTERED_CLIENTS.get(request.getClientId());
-            if (clientSecret == null || !clientSecret.equals(request.getClientSecret())) {
+            String clientId = request.getClientId();
+            String clientSecret = request.getClientSecret();
+
+            // Proteccion contra NullPointerException (Map.of no permite claves nulas)
+            if (clientId == null || clientSecret == null || !clientSecret.equals(REGISTERED_CLIENTS.get(clientId))) {
                 return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
-                        .body(Map.of("error", "invalid_client", "error_description", "client_id o client_secret invalidos"));
+                        .body(Map.of("error", "invalid_client", "error_description", "client_id o client_secret invalidos o ausentes"));
             }
 
-            String token = jwtService.generateClientToken(request.getClientId(), request.getScope());
+            String token = jwtService.generateClientToken(clientId, request.getScope());
             String scope = request.getScope() != null ? request.getScope() : "games:read games:write orders:create";
 
             return ResponseEntity.ok(new TokenResponse(
@@ -53,7 +56,7 @@ public class AuthController {
                     "Bearer",
                     3600,
                     scope,
-                    "Header.Payload.Signature (HS256)"
+                    "Header.Payload.Signature (HS512)"
             ));
         }
 
@@ -77,7 +80,7 @@ public class AuthController {
                     "Bearer",
                     3600,
                     scope,
-                    "Header.Payload.Signature (HS256)"
+                    "Header.Payload.Signature (HS512)"
             ));
         }
 
